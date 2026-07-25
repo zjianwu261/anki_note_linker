@@ -14,11 +14,10 @@ import re
 __version__ = "0.7"
 
 from aqt import dialogs, gui_hooks, mw
-from aqt.qt import QMenu, qconnect
+from aqt.qt import QKeySequence, QMenu, qconnect
 from aqt.utils import askUser, getText, showInfo, tooltip
 
 from . import llm, similarity
-from .graph import show_graph
 
 LINK_RE = re.compile(r"notelinker:open:(\d+)")
 CSS_MARK = "/* note-linker-css */"
@@ -236,92 +235,6 @@ def on_browser_context_menu(browser, menu):
     qconnect(a1.triggered, lambda: link_selected(browser))
     a2 = sub.addAction("✂️ 清除所选笔记的关联")
     qconnect(a2.triggered, lambda: unlink_selected(browser))
-
-
-# ---------------- 自动关联 (语义相似) ----------------
-
-def auto_link():
-    cfg = get_config()
-    query, ok = getText(
-        "搜索范围 (Anki 搜索语法, 留空 = 全部笔记):\n例如 deck:英语  tag:医学",
-        default=cfg.get("search_query", ""),
-        title="自动关联",
-    )
-    if not ok:
-        return
-    query = query.strip() or "deck:*"
-    nids = list(mw.col.find_notes(query))
-    if len(nids) < 2:
-        showInfo("该范围内笔记不足两条 (找到 %d 条)。" % len(nids))
-        return
-    if len(nids) > 20000 and not askUser(
-        "找到 %d 条笔记, 计算可能需要一些时间, 继续?" % len(nids)
-    ):
-        return
-
-    fname = field_name()
-    exclude = set(cfg.get("exclude_fields", [])) | {fname}
-    docs = {}
-    for nid in nids:
-        note = mw.col.get_note(nid)
-        texts = [
-            val for name, val in note.items()
-            if name not in exclude and val.strip()
-        ]
-        text = " ".join(texts)
-        if text.strip():
-            docs[nid] = text
-
-    threshold = float(cfg.get("similarity_threshold", 0.28))
-    max_links = int(cfg.get("max_links_per_note", 5))
-
-    mw.progress.start(label="正在计算语义相似度…", immediate=True)
-
-    def compute():
-        vecs = similarity.build_vectors(docs)
-        return similarity.similar_map(vecs, threshold, max_links)
-
-    def on_done(fut):
-        try:
-            result = fut.result()
-        except Exception as e:
-            mw.progress.finish()
-            showInfo("计算失败: %s" % e)
-            return
-        try:
-            _apply_auto_links(result)
-        finally:
-            mw.progress.finish()
-
-    mw.taskman.run_in_background(compute, on_done)
-
-
-def _apply_auto_links(result):
-    if not result:
-        showInfo("没有找到达到阈值的相似笔记。\n可在插件配置中调低 similarity_threshold。")
-        return
-    mids = []
-    for nid in result:
-        try:
-            mids.append(mw.col.get_note(nid).mid)
-        except Exception:
-            pass
-    ensure_field_on_models(mids)
-
-    updated = 0
-    for nid, pairs in result.items():
-        try:
-            note = mw.col.get_note(nid)
-        except Exception:
-            continue
-        existing = get_link_ids(note)  # 保留已有(含手动)关联, 排在前面
-        merged = existing + [b for b, _ in pairs if b not in existing]
-        if set_links(note, merged):
-            mw.col.update_note(note)
-            updated += 1
-    mw.reset()
-    showInfo("自动关联完成: 共为 %d 条笔记建立/更新了关联。" % updated)
-
 
 # ---------------- LLM 主题关联 (DeepSeek) ----------------
 
@@ -711,59 +624,6 @@ def on_js_message(handled, message, context):
             return (True, None)
     return handled
 
-
-# ---------------- 图谱数据 ----------------
-
-def collect_graph_data():
-    """扫描所有含链接的笔记 -> (nodes, edges)
-
-    nodes: {nid: {"t": 标题, "g": 主题名(可为空)}}
-    """
-    fname = field_name()
-    prefix = get_config()["topic_tag_prefix"]
-    nids = mw.col.find_notes('"%s:_*"' % fname)
-    nodes, edges, seen_edges = {}, [], set()
-
-    def add_node(nid, note):
-        if nid in nodes:
-            return
-        topic = ""
-        for t in note.tags:
-            if t.startswith(prefix):
-                topic = t[len(prefix):]
-                break
-        nodes[nid] = {"t": note_title(note, 24), "g": topic}
-
-    for nid in nids:
-        try:
-            note = mw.col.get_note(nid)
-        except Exception:
-            continue
-        links = get_link_ids(note)
-        if not links:
-            continue
-        add_node(nid, note)
-        for other in links:
-            try:
-                onote = mw.col.get_note(other)
-            except Exception:
-                continue
-            add_node(other, onote)
-            key = (nid, other) if nid < other else (other, nid)
-            if key not in seen_edges:
-                seen_edges.add(key)
-                edges.append(key)
-    return nodes, edges
-
-
-def show_graph_action():
-    nodes, edges = collect_graph_data()
-    if not nodes:
-        showInfo("还没有任何关联。\n先用浏览器右键手动关联, 或运行\"自动关联\"。")
-        return
-    show_graph(mw, nodes, edges, open_note_in_browser)
-
-
 # ---------------- 菜单注册 ----------------
 
 def refresh_links_html():
@@ -788,17 +648,12 @@ def setup_menu():
     menu = QMenu("Note Linker 卡片关联 v%s" % __version__, mw)
     mw.form.menuTools.addMenu(menu)
 
-    a1 = menu.addAction("🤖 自动关联 (TF-IDF 相似)…")
-    qconnect(a1.triggered, auto_link)
-
     a3 = menu.addAction("🧠 LLM 主题关联 (DeepSeek)…")
+    a3.setShortcut(QKeySequence("Ctrl+Shift+L"))
     qconnect(a3.triggered, llm_topic_link)
 
     a4 = menu.addAction("🔄 刷新链接样式/快照")
     qconnect(a4.triggered, refresh_links_html)
-
-    a2 = menu.addAction("🕸️ 知识图谱")
-    qconnect(a2.triggered, show_graph_action)
 
 
 setup_menu()
