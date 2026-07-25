@@ -649,10 +649,10 @@ def setup_menu():
     mw.form.menuTools.addMenu(menu)
 
     a3 = menu.addAction("🧠 LLM 主题关联 (DeepSeek)…")
-    a3.setShortcut(QKeySequence("Ctrl+Shift+L"))
     qconnect(a3.triggered, llm_topic_link)
 
     a4 = menu.addAction("🔄 刷新链接样式/快照")
+    a4.setShortcut(QKeySequence("Ctrl+Shift+L"))
     qconnect(a4.triggered, refresh_links_html)
 
 
