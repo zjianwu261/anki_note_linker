@@ -1,0 +1,15 @@
+{
+  "field_name": "相关卡片",
+  "similarity_threshold": 0.28,
+  "max_links_per_note": 5,
+  "search_query": "",
+  "add_to_template": true,
+  "exclude_fields": [],
+  "api_base": "https://api.deepseek.com",
+  "api_key": "",
+  "llm_model": "deepseek-v4-flash",
+  "llm_batch_size": 40,
+  "llm_snippet_chars": 120,
+  "link_title_chars": 120,
+  "topic_tag_prefix": "NL::"
+}
