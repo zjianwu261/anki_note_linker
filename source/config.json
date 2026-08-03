@@ -11,5 +11,6 @@
   "llm_batch_size": 40,
   "llm_snippet_chars": 120,
   "link_title_chars": 120,
-  "topic_tag_prefix": "NL::"
+  "topic_tag_prefix": "NL::",
+  "llm_selected_decks": []
 }

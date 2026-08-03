@@ -50,7 +50,15 @@ def get_config():
     cfg.setdefault("llm_snippet_chars", 120)
     cfg.setdefault("link_title_chars", 120)
     cfg.setdefault("topic_tag_prefix", "NL::")
+    cfg.setdefault("llm_selected_decks", [])
     return cfg
+
+
+def save_config_keys(**kv):
+    """只写入指定的键, 不覆盖用户手改的其他配置。"""
+    raw = mw.addonManager.getConfig(__name__) or {}
+    raw.update(kv)
+    mw.addonManager.writeConfig(__name__, raw)
 
 
 def field_name():
@@ -248,10 +256,134 @@ def _ensure_api_key():
     )
     if not ok or not key.strip():
         return False
-    raw = mw.addonManager.getConfig(__name__) or {}
-    raw["api_key"] = key.strip()
-    mw.addonManager.writeConfig(__name__, raw)
+    save_config_keys(api_key=key.strip())
     return True
+
+
+def _escape_deck(name):
+    """转义牌组名, 使其能安全放进 deck:"..." 搜索。"""
+    out = name.replace("\\", "\\\\").replace('"', '\\"')
+    return out.replace("*", "\\*").replace("_", "\\_")
+
+
+def _build_deck_tree(tree_widget):
+    """按 :: 层级把所有牌组建成可勾选的树, 返回 {全名: QTreeWidgetItem}。"""
+    from aqt.qt import Qt, QTreeWidgetItem
+
+    names = sorted(
+        (d.name for d in mw.col.decks.all_names_and_ids()),
+        key=lambda s: s.lower(),
+    )
+    items = {}
+    flags = (
+        Qt.ItemFlag.ItemIsEnabled
+        | Qt.ItemFlag.ItemIsUserCheckable
+        | Qt.ItemFlag.ItemIsAutoTristate
+    )
+    for full in names:
+        parts = full.split("::")
+        for i in range(len(parts)):
+            path = "::".join(parts[: i + 1])
+            if path in items:
+                continue
+            parent = items.get("::".join(parts[:i])) if i else None
+            item = QTreeWidgetItem(parent or tree_widget, [parts[i]])
+            item.setFlags(flags)
+            item.setCheckState(0, Qt.CheckState.Unchecked)
+            item.setData(0, Qt.ItemDataRole.UserRole, path)
+            items[path] = item
+    return items
+
+
+def _checked_decks(tree_widget):
+    """收集最上层被完全勾选的牌组 (deck:X 已包含子牌组)。"""
+    from aqt.qt import Qt
+
+    picked = []
+
+    def walk(item):
+        state = item.checkState(0)
+        if state == Qt.CheckState.Checked:
+            picked.append(item.data(0, Qt.ItemDataRole.UserRole))
+            return
+        if state == Qt.CheckState.PartiallyChecked:
+            for i in range(item.childCount()):
+                walk(item.child(i))
+
+    for i in range(tree_widget.topLevelItemCount()):
+        walk(tree_widget.topLevelItem(i))
+    return picked
+
+
+def pick_decks(preselected=None):
+    """弹出牌组勾选对话框。返回选中的牌组全名列表, 取消返回 None。"""
+    from aqt.qt import (
+        QDialog,
+        QDialogButtonBox,
+        QHBoxLayout,
+        QLabel,
+        QPushButton,
+        Qt,
+        QTreeWidget,
+        QVBoxLayout,
+    )
+
+    dlg = QDialog(mw)
+    dlg.setWindowTitle("LLM 主题关联 — 选择牌组")
+    dlg.resize(460, 540)
+    layout = QVBoxLayout(dlg)
+    layout.addWidget(QLabel("勾选要参与主题分类的牌组 (勾选父牌组会包含其子牌组):"))
+
+    tree = QTreeWidget()
+    tree.setHeaderHidden(True)
+    items = _build_deck_tree(tree)
+    tree.expandAll()
+    layout.addWidget(tree)
+
+    for name in preselected or []:
+        item = items.get(name)
+        if item is not None:
+            item.setCheckState(0, Qt.CheckState.Checked)
+
+    count_label = QLabel("")
+    row = QHBoxLayout()
+    btn_all = QPushButton("全选")
+    btn_none = QPushButton("全不选")
+    row.addWidget(btn_all)
+    row.addWidget(btn_none)
+    row.addStretch()
+    row.addWidget(count_label)
+    layout.addLayout(row)
+
+    box = QDialogButtonBox(
+        QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+    )
+    ok_btn = box.button(QDialogButtonBox.StandardButton.Ok)
+    layout.addWidget(box)
+
+    def set_all(state):
+        for i in range(tree.topLevelItemCount()):
+            tree.topLevelItem(i).setCheckState(0, state)
+
+    def refresh():
+        n = len(_checked_decks(tree))
+        count_label.setText("已选 %d 个牌组" % n)
+        ok_btn.setEnabled(n > 0)
+
+    qconnect(btn_all.clicked, lambda: set_all(Qt.CheckState.Checked))
+    qconnect(btn_none.clicked, lambda: set_all(Qt.CheckState.Unchecked))
+    qconnect(tree.itemChanged, lambda *_: refresh())
+    qconnect(box.accepted, dlg.accept)
+    qconnect(box.rejected, dlg.reject)
+    refresh()
+
+    if dlg.exec() != QDialog.DialogCode.Accepted:
+        return None
+    return _checked_decks(tree)
+
+
+def _decks_to_query(decks):
+    return " OR ".join('deck:"%s"' % _escape_deck(d) for d in decks)
 
 
 def _collect_docs(query):
@@ -275,24 +407,23 @@ def llm_topic_link():
     if not _ensure_api_key():
         return
     cfg = get_config()
-    query, ok = getText(
-        "搜索范围 (Anki 搜索语法, 留空 = 全部笔记):\n例如 deck:英语  tag:医学",
-        default=cfg.get("search_query", ""),
-        title="LLM 主题关联",
-    )
-    if not ok:
+    decks = pick_decks(cfg.get("llm_selected_decks") or [])
+    if not decks:
         return
-    query = query.strip() or "deck:*"
+    save_config_keys(llm_selected_decks=decks)
+    query = _decks_to_query(decks)
     docs = _collect_docs(query)
     if len(docs) < 2:
-        showInfo("该范围内笔记不足两条 (找到 %d 条)。" % len(docs))
+        showInfo("所选牌组内笔记不足两条 (找到 %d 条)。" % len(docs))
         return
     est_batches = len(docs) // int(cfg["llm_batch_size"]) + 1
+    deck_list = "、".join(decks[:5]) + ("…" if len(decks) > 5 else "")
     if not askUser(
+        "牌组: %s\n\n"
         "将把 %d 条笔记的摘要分 %d 批发送给 %s 进行主题分类,\n"
         "并写入主题标签 (%s主题名) 和\"相关卡片\"链接。\n\n"
         "费用很低 (约每千卡几分钱), 内容摘要会发送到 API。继续?"
-        % (len(docs), est_batches, cfg["llm_model"], cfg["topic_tag_prefix"])
+        % (deck_list, len(docs), est_batches, cfg["llm_model"], cfg["topic_tag_prefix"])
     ):
         return
 
